@@ -59,7 +59,7 @@ def check_token(authorization: Optional[str]):
     if authorization.split(" ", 1)[1] != API_TOKEN:
         raise HTTPException(status_code=403, detail="Bad token")
 
- # --- Auto-register with WordPress (optional, set via ENV) ---
+# --- Auto-register with WordPress (optional, set via ENV) ---
 WP_URL = os.getenv("WP_URL")  # e.g. https://tvoja-wp-domena.sk
 WP_SHARED_SECRET = os.getenv("WP_SHARED_SECRET", "pb-secret-123")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL")  # e.g. https://xyz.ngrok-free.app or Render URL (no trailing slash)
