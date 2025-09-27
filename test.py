@@ -188,7 +188,10 @@ def _strip_tags(html_text: str) -> str:
     text = re.sub(r"(?is)<script.*?>.*?</script>", " ", html_text)
     text = re.sub(r"(?is)<style.*?>.*?</style>", " ", text)
     text = re.sub(r"(?s)<[^>]+>", " ", text)
+    # Decode HTML entities including &nbsp;
     text = html.unescape(text)
+    # Handle Norwegian thousand separators and spaces
+    text = re.sub(r"(\d)\s+(\d{3})", r"\1\2", text)  # Remove spaces in numbers like "2 490"
     text = re.sub(r"[\s\u00A0\u202F]+", " ", text).strip()
     return text
 
@@ -299,11 +302,11 @@ def normalize_price_no(raw: Optional[str]) -> Optional[str]:
     val, cur = price_to_number(raw)
     if val is None:
         return None
-    # For Norwegian sites, convert most reasonable prices to kr format
+    # For Norwegian sites, convert NOK and reasonable prices to kr format
     # Only keep foreign currency if it's clearly a major international currency with large amounts
     if cur in ('EUR', 'USD', 'GBP') and val > 100:
         return raw  # Keep major foreign currencies for expensive items
-    # Convert everything else to Norwegian kr format
+    # Convert NOK, unknown currency, and everything else to Norwegian kr format
     return f"kr {_fmt_number_no(val)}"
 
 
@@ -351,26 +354,42 @@ def from_jsonld(html_text: str) -> Optional[str]:
             expanded.append(n)
             if isinstance(n, dict) and "@graph" in n and isinstance(n["@graph"], list):
                 expanded.extend(n["@graph"])
-        offers: List[dict] = []
-        for n in expanded:
-            if not isinstance(n, dict):
-                continue
-            o = n.get('offers')
-            if o:
-                offers.extend(o if isinstance(o, list) else [o])
+
+        # Look for direct price fields in any node (Maxbo pattern)
         cands: List[str] = []
-        for o in offers:
-            if not isinstance(o, dict):
-                continue
-            price = o.get('price') or o.get('lowPrice')
-            cur = o.get('priceCurrency')
-            if price is None:
-                continue
-            raw = f"{cur} {price}" if cur else str(price)
-            cands.append(raw)
+        def extract_prices_from_node(node):
+            if isinstance(node, dict):
+                # Direct price field (like Maxbo's "price":"2490.00")
+                if 'price' in node and isinstance(node['price'], (str, int, float)):
+                    price_val = str(node['price'])
+                    if re.search(r'\d', price_val):
+                        cands.append(f"kr {price_val}")
+
+                # Traditional offers structure
+                offers = node.get('offers')
+                if offers:
+                    offers_list = offers if isinstance(offers, list) else [offers]
+                    for o in offers_list:
+                        if isinstance(o, dict):
+                            price = o.get('price') or o.get('lowPrice')
+                            cur = o.get('priceCurrency')
+                            if price is not None:
+                                raw = f"{cur} {price}" if cur else str(price)
+                                cands.append(raw)
+
+                # Recurse into nested objects
+                for v in node.values():
+                    if isinstance(v, (dict, list)):
+                        extract_prices_from_node(v)
+            elif isinstance(node, list):
+                for item in node:
+                    extract_prices_from_node(item)
+
+        extract_prices_from_node(data)
+
         if cands:
             best = _best_from_candidates(cands)
-            if best and extract_prices_from_text(best):
+            if best:
                 return best
     return None
 
@@ -403,7 +422,19 @@ def from_price_blocks(html_text: str) -> Optional[str]:
         return None
     cands: List[str] = []
     for b in blocks:
-        cands.extend(extract_prices_from_text(b))
+        # Try normal price extraction first
+        found_prices = extract_prices_from_text(b)
+        if found_prices:
+            cands.extend(found_prices)
+        else:
+            # For Norwegian sites, try to extract standalone numbers and add "kr"
+            number_match = re.search(r'\b(\d{2,5}(?:[.,]\d{2})?)\b', b)
+            if number_match:
+                num = number_match.group(1)
+                val, _ = price_to_number(num)
+                if val and 10 <= val <= 100000:  # Reasonable price range
+                    cands.append(f"kr {num}")
+
     if not cands:
         return None
     return _best_from_candidates(cands)
@@ -826,16 +857,113 @@ def detect_prices(html_text: str) -> dict:
         elif price_regular is None and REGULAR_HINTS.search(ctx):
             price_regular = raw
 
-    # Prefer Next.js/React state first (covers sites like maxbo.no / torn.no)
+    # Enhanced extraction order for Norwegian sites
+    base = None
+
+    # 1) Try Next.js/React state first (covers modern sites)
     base = from_nextdata(html_text)
 
-    # Fallback chain using existing detectors
-    if not base and candidates:
-        base = _best_from_candidates([raw for _ctx, raw in candidates])
+    # 2) Try traditional structured methods first (more reliable)
     if not base:
-        base = from_jsonld(html_text) or from_meta(html_text) or from_price_blocks(html_text) or from_visible_text(html_text)
+        base = from_jsonld(html_text) or from_meta(html_text)
+
+    # 3) Try price blocks (CSS selectors - reliable)
+    if not base:
+        base = from_price_blocks(html_text)
+
+    # 4) Filter candidates by currency preference (medium reliability)
+    if not base and candidates:
+        # Prefer Norwegian currency
+        norwegian_candidates = [raw for _ctx, raw in candidates if any(term in raw.lower() for term in ['kr', 'nok'])]
+        foreign_candidates = [raw for _ctx, raw in candidates if not any(term in raw.lower() for term in ['kr', 'nok'])]
+
+        if norwegian_candidates:
+            base = _best_from_candidates(norwegian_candidates)
+        elif foreign_candidates:
+            base = _best_from_candidates(foreign_candidates)
+
+    # 5) Enhanced Norwegian extraction (aggressive, lower reliability)
+    if not base:
+        base = extract_norwegian_prices_enhanced(html_text)
+
+    # 6) Visible text as final fallback
+    if not base:
+        base = from_visible_text(html_text)
 
     return {"price": base, "price_regular": price_regular, "price_member": price_member}
+
+
+def extract_norwegian_prices_enhanced(html_text: str) -> Optional[str]:
+    """Enhanced Norwegian price extraction for modern e-commerce sites."""
+    if not html_text:
+        return None
+
+    # Norwegian-specific patterns for modern e-commerce sites
+    norwegian_patterns = [
+        # React/Vue/Angular component data attributes
+        r'data-price["\s]*:[\s]*["\']([^"\']+)["\']',
+        r'"price"[:\s]*"([^"]+)"',
+        r'"currentPrice"[:\s]*"([^"]+)"',
+        r'"displayPrice"[:\s]*"([^"]+)"',
+        r'"sellPrice"[:\s]*"([^"]+)"',
+        r'"amount"[:\s]*(\d+(?:\.\d+)?)',
+
+        # Norwegian specific classes and IDs
+        r'class="[^"]*pris[^"]*"[^>]*>([^<]+)</[^>]*>',
+        r'id="[^"]*pris[^"]*"[^>]*>([^<]+)</[^>]*>',
+        r'data-testid="[^"]*price[^"]*"[^>]*>([^<]+)</[^>]*>',
+
+        # Modern price containers with Norwegian currency
+        r'<span[^>]*class="[^"]*price[^"]*"[^>]*>([^<]*\d+[^<]*kr[^<]*)</span>',
+        r'<div[^>]*class="[^"]*price[^"]*"[^>]*>([^<]*\d+[^<]*kr[^<]*)</div>',
+        r'<p[^>]*class="[^"]*price[^"]*"[^>]*>([^<]*\d+[^<]*kr[^<]*)</p>',
+
+        # Direct Norwegian currency patterns with word boundaries
+        r'\b(\d+(?:[.,\s]\d{3})*(?:[.,]\d{2})?\s*kr)\b',
+        r'\b(kr\s*\d+(?:[.,\s]\d{3})*(?:[.,]\d{2})?)\b',
+        r'\b(\d+(?:[.,\s]\d{3})*(?:[.,]\d{2})?\s*NOK)\b',
+
+        # JavaScript variable assignments (common in Norwegian sites)
+        r'price["\s]*:["\s]*(\d+(?:\.\d+)?)',
+        r'pris["\s]*:["\s]*(\d+(?:\.\d+)?)',
+        r'amount["\s]*:["\s]*(\d+(?:\.\d+)?)',
+    ]
+
+    all_matches = []
+    for pattern in norwegian_patterns:
+        for match in re.finditer(pattern, html_text, re.I):
+            price_text = match.group(1).strip()
+
+            # Skip if empty or too long
+            if not price_text or len(price_text) > 30:
+                continue
+
+            # Clean and validate
+            if re.search(r'\d', price_text):
+                # Try to extract with existing function first
+                prices_found = extract_prices_from_text(price_text)
+                if prices_found:
+                    all_matches.extend(prices_found)
+                else:
+                    # Handle direct number matches
+                    num_match = re.search(r'(\d+(?:[.,]\d+)?)', price_text)
+                    if num_match:
+                        num_part = num_match.group(1)
+                        # Convert to Norwegian format
+                        all_matches.append(f"kr {num_part}")
+
+    if all_matches:
+        # Filter reasonable prices and prefer Norwegian currency
+        reasonable_prices = []
+        for price in all_matches:
+            val, cur = price_to_number(price)
+            if val and 10 <= val <= 100000:  # Reasonable price range for Norwegian products
+                reasonable_prices.append(price)
+
+        if reasonable_prices:
+            return _best_from_candidates(reasonable_prices)
+
+    return None
 
 
 def get_prices(url: str) -> dict:
