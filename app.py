@@ -9,6 +9,7 @@ import os, requests
 from test import (
     get_price,
     get_prices,
+    get_prices_for_ean,
     upcitemdb_lookup,
     build_variants,
     google_cse_fetch,
@@ -20,6 +21,9 @@ from test import (
 )
 
 app = FastAPI(title="Price Bridge", version="1.0")
+
+# Block marketplaces/aggregators
+BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com"}
 
 # --- very simple in-memory rate limit (per IP per minute) ---
 from time import time
@@ -126,6 +130,7 @@ def endpoint_ean(
         per_domain: int = 1,
         sites: Optional[str] = None,
         only_no: int = 0,
+        include_empty: int = 0,
         authorization: Optional[str] = Header(None),
         request: Request = None
 ):
@@ -144,6 +149,8 @@ def endpoint_ean(
         if not link:
             continue
         host = host_from_url(link)
+        if host in BLOCKLIST:
+            continue
         if only_no and not host.endswith(".no"):
             continue
         # removed TLD restriction to allow all markets
@@ -168,7 +175,7 @@ def endpoint_ean(
 
     hl = MARKET_CFG.get(market, {}).get("hl")
     gl = MARKET_CFG.get(market, {}).get("gl")
-    default_sites = " ".join(MARKET_DOMAINS.get(market, [])) if market else ""
+    default_sites = ""
     sites_arg = sites if sites else default_sites
 
     queries = build_variants(ean, keywords="", sites=sites_arg)
@@ -189,12 +196,29 @@ def endpoint_ean(
                 if not link or link in printed_links:
                     continue
                 host = host_from_url(link)
+                if host in BLOCKLIST:
+                    continue
                 if only_no and not host.endswith(".no"):
                     continue
                 # removed TLD restriction to allow all markets
                 if per_domain > 0 and seen_per_domain.get(host, 0) >= per_domain:
                     continue
-                prices = get_prices(link)
+
+                prices = get_prices_for_ean(link, ean)
+                if not prices or not prices.get("price"):
+                    if include_empty:
+                        out.append(PriceItem(
+                            retailer=host,
+                            url=link,
+                            price=None,
+                            price_regular=None,
+                            price_member=None,
+                            ts=datetime.utcnow().isoformat(),
+                        ))
+                        printed_links.add(link)
+                        seen_per_domain[host] = seen_per_domain.get(host, 0) + 1
+                    continue
+
                 out.append(PriceItem(
                     retailer=host,
                     url=link,
@@ -207,7 +231,6 @@ def endpoint_ean(
                 seen_per_domain[host] = seen_per_domain.get(host, 0) + 1
                 if len(out) >= limit:
                     break
-            if len(out) >= limit:
-                break
+
 
     return {"items": out}
