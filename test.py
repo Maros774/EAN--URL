@@ -1337,8 +1337,19 @@ def selenium_fetch(url: str, timeout: int = 15, wait_for_element: str = None) ->
         chrome_options.add_argument('--disable-features=TranslateUI')
         chrome_options.add_argument('--disable-ipc-flooding-protection')
 
+        # Set Chrome binary location from environment (Docker/Render.com)
+        chrome_bin = os.getenv('CHROME_BIN')
+        if chrome_bin:
+            chrome_options.binary_location = chrome_bin
+
         # Create driver with minimal resource usage
-        service = Service(ChromeDriverManager().install())
+        # Use system chromedriver if available (Docker/Render.com), otherwise use webdriver-manager
+        chromedriver_path = os.getenv('CHROMEDRIVER_PATH')
+        if chromedriver_path and os.path.exists(chromedriver_path):
+            service = Service(chromedriver_path)
+        else:
+            service = Service(ChromeDriverManager().install())
+
         driver = webdriver.Chrome(service=service, options=chrome_options)
         driver.set_page_load_timeout(timeout)
 
