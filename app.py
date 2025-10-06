@@ -129,7 +129,7 @@ def endpoint_ean(
         limit: int = 10,
         per_domain: int = 1,
         sites: Optional[str] = None,
-        only_no: int = 0,
+        only_no: int = 1,  # Default to .no domains only
         include_empty: int = 0,
         authorization: Optional[str] = Header(None),
         request: Request = None

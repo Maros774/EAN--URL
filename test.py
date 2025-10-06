@@ -11,8 +11,15 @@ import html
 import argparse
 from typing import Optional, Tuple, List, Iterable, Dict
 import requests
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
+import time
 
-# === CONFIG === (taken from your PHP)
 GOOGLE_API_KEY = os.getenv('GOOGLE_API_KEY', '')
 GOOGLE_CSE_CX  = os.getenv('GOOGLE_CSE_CX',  '')
 
@@ -26,7 +33,10 @@ HEADERS = {
 }
 
 # Exclude marketplaces/aggregators we don't want
-BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com"}
+BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com", "proff.maxbo.no"}
+
+# Sites that REQUIRE Selenium (JavaScript-heavy, won't work with conventional fetch)
+JS_HEAVY_SITES = {"maxbo.no", "proff.maxbo.no"}
 
 # --- Regex building blocks (allow normal/NBSP/thin spaces) ---
 SP = r"[\s\u00A0\u202F]*"
@@ -966,18 +976,170 @@ def extract_norwegian_prices_enhanced(html_text: str) -> Optional[str]:
     return None
 
 
-def get_prices(url: str) -> dict:
-    html_text = fetch(url)
-    if not html_text:
-        return {}
+def is_js_heavy_site(host: str) -> bool:
+    """Check if a host requires Selenium due to JavaScript-heavy rendering"""
+    return any(host.endswith(site) for site in JS_HEAVY_SITES)
+
+
+def extract_prices_from_html(html_text: str, local_host: str, expected_ean: Optional[str] = None, debug: bool = False) -> dict:
+    """
+    Unified price extraction logic using all available extractors.
+
+    Strategy:
+    1. Try per-site extractors (obsbygg, maxbo, etc.)
+    2. Try generic JSON-LD/__NEXT_DATA__ extraction (with optional EAN matching)
+    3. Fallback to generic price detection
+    """
+    if debug:
+        print(f"[debug] host={local_host} -> trying per-site extractors")
+
+    # 1) Per-site extractor(s)
+    if local_host.endswith("obsbygg.no") and expected_ean:
+        if debug:
+            print("[debug] obsbygg extractor: start")
+        out = extract_obsbygg(html_text, expected_ean)
+        if out:
+            if local_host.endswith('.no'):
+                out["price"] = normalize_price_no(out.get("price")) or out.get("price")
+                out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
+                out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
+            if debug:
+                print(f"[debug] obsbygg extractor: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
+            return out
+        elif debug:
+            print("[debug] obsbygg extractor: no match")
+
+    if (local_host.endswith("maxbo.no") or local_host.endswith("proff.maxbo.no")) and expected_ean:
+        if debug:
+            print("[debug] maxbo extractor: start")
+        out = extract_maxbo(html_text, expected_ean)
+        if out:
+            if local_host.endswith('.no'):
+                out["price"] = normalize_price_no(out.get("price")) or out.get("price")
+                out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
+                out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
+            if debug:
+                print(f"[debug] maxbo extractor: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
+            return out
+        elif debug:
+            print("[debug] maxbo extractor: no match")
+
+    # 2) Generic: match variant by EAN from JSON-LD / __NEXT_DATA__ (if EAN provided)
+    if expected_ean:
+        if debug:
+            print("[debug] generic JSON-LD/__NEXT_DATA__: start")
+        out = extract_price_for_matching_ean(html_text, expected_ean)
+        if out:
+            if local_host.endswith('.no'):
+                out["price"] = normalize_price_no(out.get("price")) or out.get("price")
+                out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
+                out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
+            if debug:
+                print(f"[debug] generic JSON-LD/__NEXT_DATA__: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
+            return out
+        elif debug:
+            print("[debug] generic JSON-LD/__NEXT_DATA__: no match")
+
+        # 3) Smart fallback with EAN validation
+        ean_found = page_contains_ean(html_text, expected_ean)
+        if debug:
+            print(f"[debug] page_contains_ean: {ean_found}")
+
+    # 4) Generic price detection as final fallback
+    if debug:
+        print("[debug] fallback detect_prices: start")
     d = detect_prices(html_text)
-    host = host_from_url(url)
-    if host.endswith('.no'):
-        # Normalize all price fields to 'kr <value>' when appropriate
+    if local_host.endswith('.no'):
         d["price"] = normalize_price_no(d.get("price")) or d.get("price")
         d["price_regular"] = normalize_price_no(d.get("price_regular")) or d.get("price_regular")
         d["price_member"] = normalize_price_no(d.get("price_member")) or d.get("price_member")
+
+    if expected_ean:
+        # If EAN not found but we got prices, be more cautious (lower confidence)
+        if not page_contains_ean(html_text, expected_ean) and any(d.values()):
+            if debug:
+                print("[debug] fallback detect_prices: OK (no EAN validation, lower confidence)")
+        elif debug:
+            print(f"[debug] fallback detect_prices: {'OK' if (d.get('price') or d.get('price_regular') or d.get('price_member')) else 'no price found'}")
+    elif debug:
+        print(f"[debug] fallback detect_prices: {'OK' if (d.get('price') or d.get('price_regular') or d.get('price_member')) else 'no price found'}")
+
     return d
+
+
+def get_prices(url: str, debug: bool = False) -> dict:
+    """
+    Extract prices from a URL with intelligent Selenium strategy.
+
+    Strategy:
+    - For JS-heavy sites (Maxbo): Use Selenium FIRST (required)
+    - For other sites: Try conventional fetch first, then Selenium as fallback
+    """
+    host = host_from_url(url)
+
+    # Determine wait element based on known sites
+    wait_element = None
+    if host.endswith("maxbo.no") or host.endswith("proff.maxbo.no"):
+        wait_element = '.product-price__price, .product-price__amount, [data-testid*="price"]'
+
+    # For JS-heavy sites: Use Selenium FIRST (they require JavaScript)
+    if is_js_heavy_site(host):
+        if debug:
+            print(f"[get_prices] JS-heavy site detected, using Selenium first: {url}")
+
+        html_text_selenium = selenium_fetch(url, timeout=20, wait_for_element=wait_element)
+        if html_text_selenium:
+            result = extract_prices_from_html(html_text_selenium, host, expected_ean=None, debug=debug)
+            if result and (result.get("price") or result.get("price_regular") or result.get("price_member")):
+                if debug:
+                    print(f"[get_prices] Selenium fetch succeeded with price")
+                return result
+            elif debug:
+                print(f"[get_prices] Selenium fetch got HTML but no price found")
+        else:
+            if debug:
+                print(f"[get_prices] Selenium fetch failed")
+
+        # If Selenium failed, don't try conventional fetch (it won't work for JS-heavy sites)
+        return {}
+
+    # For regular sites: Try conventional fetch first
+    if debug:
+        print(f"[get_prices] trying conventional fetch: {url}")
+    html_text = fetch(url)
+
+    if html_text:
+        result = extract_prices_from_html(html_text, host, expected_ean=None, debug=debug)
+        # If we found a price, return it
+        if result and (result.get("price") or result.get("price_regular") or result.get("price_member")):
+            if debug:
+                print(f"[get_prices] conventional fetch succeeded with price")
+            return result
+        elif debug:
+            print(f"[get_prices] conventional fetch got HTML but no price found")
+    else:
+        if debug:
+            print(f"[get_prices] conventional fetch failed")
+
+    # Selenium fallback for regular sites: if conventional fetch failed OR didn't find price
+    if debug:
+        print(f"[get_prices] trying Selenium fallback: {url}")
+
+    html_text_selenium = selenium_fetch(url, timeout=20, wait_for_element=wait_element)
+
+    if not html_text_selenium:
+        if debug:
+            print(f"[get_prices] Selenium fetch also failed")
+        # Return whatever we got from conventional fetch (might be empty)
+        return extract_prices_from_html(html_text, host, expected_ean=None, debug=debug) if html_text else {}
+
+    # Extract prices from Selenium result
+    result_selenium = extract_prices_from_html(html_text_selenium, host, expected_ean=None, debug=debug)
+    if debug:
+        has_price = result_selenium and (result_selenium.get("price") or result_selenium.get("price_regular") or result_selenium.get("price_member"))
+        print(f"[get_prices] Selenium fetch {'succeeded with price' if has_price else 'got HTML but no price'}")
+
+    return result_selenium
 
 
 # --- URL variant adjustment (when URL embeds a different EAN/UPC) ---
@@ -1045,89 +1207,85 @@ def adjust_url_for_ean(url: str, ean: str) -> List[str]:
 
 
 def get_prices_for_ean(url: str, expected_ean: str, debug: bool = False) -> dict:
+    """
+    Extract prices for a specific EAN from a URL.
+    Uses the unified extraction logic with Selenium fallback.
+    """
     host = host_from_url(url)
 
     # Try adjusted candidate URLs if the URL embeds a different variant id/EAN
     candidates = adjust_url_for_ean(url, expected_ean)
 
     def attempt(one_url: str) -> dict:
-        html_text = fetch(one_url)
-        if not html_text:
-            if debug:
-                print(f"[debug] fetch failed: {one_url}")
-            return {}
         local_host = host_from_url(one_url)
 
-        if debug:
-            print(f"[debug] host={local_host} -> trying per-site extractors")
-
-        # 1) Per-site extractor(s)
-        if local_host.endswith("obsbygg.no"):
-            if debug:
-                print("[debug] obsbygg extractor: start")
-            out = extract_obsbygg(html_text, expected_ean)
-            if out:
-                if local_host.endswith('.no'):
-                    out["price"] = normalize_price_no(out.get("price")) or out.get("price")
-                    out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
-                    out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
-                if debug:
-                    print(f"[debug] obsbygg extractor: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
-                return out
-            elif debug:
-                print("[debug] obsbygg extractor: no match")
-
+        # Determine wait element based on known sites
+        wait_element = None
         if local_host.endswith("maxbo.no") or local_host.endswith("proff.maxbo.no"):
+            wait_element = '.product-price__price, .product-price__amount, [data-testid*="price"]'
+
+        # STRATEGY:
+        # - For JS-heavy sites (Maxbo): Use Selenium FIRST (required)
+        # - For other sites: Try conventional fetch first, then Selenium as fallback
+
+        # For JS-heavy sites: Use Selenium FIRST (they require JavaScript)
+        if is_js_heavy_site(local_host):
             if debug:
-                print("[debug] maxbo extractor: start")
-            out = extract_maxbo(html_text, expected_ean)
-            if out:
-                if local_host.endswith('.no'):
-                    out["price"] = normalize_price_no(out.get("price")) or out.get("price")
-                    out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
-                    out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
+                print(f"[debug] JS-heavy site detected, using Selenium first: {one_url}")
+
+            html_text_selenium = selenium_fetch(one_url, timeout=20, wait_for_element=wait_element)
+            if html_text_selenium:
+                result = extract_prices_from_html(html_text_selenium, local_host, expected_ean=expected_ean, debug=debug)
+                if result and (result.get("price") or result.get("price_regular") or result.get("price_member")):
+                    if debug:
+                        print(f"[debug] Selenium fetch succeeded with price")
+                    return result
+                elif debug:
+                    print(f"[debug] Selenium fetch got HTML but no price found")
+            else:
                 if debug:
-                    print(f"[debug] maxbo extractor: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
-                return out
+                    print(f"[debug] Selenium fetch failed: {one_url}")
+
+            # If Selenium failed, don't try conventional fetch (it won't work for JS-heavy sites)
+            return {}
+
+        # For regular sites: Try conventional fetch first
+        if debug:
+            print(f"[debug] trying conventional fetch: {one_url}")
+        html_text = fetch(one_url)
+
+        if not html_text:
+            if debug:
+                print(f"[debug] conventional fetch failed: {one_url}")
+        else:
+            # Try extracting prices from conventional fetch using unified logic
+            result = extract_prices_from_html(html_text, local_host, expected_ean=expected_ean, debug=debug)
+            if result and (result.get("price") or result.get("price_regular") or result.get("price_member")):
+                if debug:
+                    print(f"[debug] conventional fetch succeeded with price")
+                return result
             elif debug:
-                print("[debug] maxbo extractor: no match")
+                print(f"[debug] conventional fetch got HTML but no price found")
 
+        # Selenium fallback for regular sites: if conventional fetch failed OR didn't find price
         if debug:
-            print("[debug] generic JSON-LD/__NEXT_DATA__: start")
-        # 2) Generic: match variant by EAN from JSON-LD / __NEXT_DATA__
-        out = extract_price_for_matching_ean(html_text, expected_ean)
-        if out:
-            if local_host.endswith('.no'):
-                out["price"] = normalize_price_no(out.get("price")) or out.get("price")
-                out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
-                out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
+            print(f"[debug] trying Selenium fallback: {one_url}")
+
+        html_text_selenium = selenium_fetch(one_url, timeout=20, wait_for_element=wait_element)
+
+        if not html_text_selenium:
             if debug:
-                print(f"[debug] generic JSON-LD/__NEXT_DATA__: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
-            return out
-        elif debug:
-            print("[debug] generic JSON-LD/__NEXT_DATA__: no match")
+                print(f"[debug] Selenium fetch also failed: {one_url}")
+            # Return whatever we got from conventional fetch (might be empty)
+            return extract_prices_from_html(html_text, local_host, expected_ean=expected_ean, debug=debug) if html_text else {}
 
-        # 3) Smart fallback: prefer EAN validation but don't require it
-        ean_found = page_contains_ean(html_text, expected_ean)
+        # Try extracting from Selenium result using unified logic
+        result_selenium = extract_prices_from_html(html_text_selenium, local_host, expected_ean=expected_ean, debug=debug)
         if debug:
-            print(f"[debug] page_contains_ean: {ean_found}")
+            has_price = result_selenium and (result_selenium.get("price") or result_selenium.get("price_regular") or result_selenium.get("price_member"))
+            print(f"[debug] Selenium fetch {'succeeded with price' if has_price else 'got HTML but no price'}")
 
-        if debug:
-            print("[debug] fallback detect_prices: start")
-        d = detect_prices(html_text)
-        if local_host.endswith('.no'):
-            d["price"] = normalize_price_no(d.get("price")) or d.get("price")
-            d["price_regular"] = normalize_price_no(d.get("price_regular")) or d.get("price_regular")
-            d["price_member"] = normalize_price_no(d.get("price_member")) or d.get("price_member")
-
-        # If EAN not found but we got prices, be more cautious (lower confidence)
-        if not ean_found and any(d.values()):
-            if debug:
-                print("[debug] fallback detect_prices: OK (no EAN validation, lower confidence)")
-        elif debug:
-            print(f"[debug] fallback detect_prices: {'OK' if (d.get('price') or d.get('price_regular') or d.get('price_member')) else 'no price found'}")
-
-        return d
+        return result_selenium
 
     # Iterate through candidates and return the first successful extraction
     for cu in candidates:
@@ -1152,6 +1310,66 @@ def fetch(url: str, timeout: int = 10, max_bytes: int = 300_000) -> Optional[str
         return content.decode(r.encoding or 'utf-8', errors='replace')
     except Exception:
         return None
+
+
+def selenium_fetch(url: str, timeout: int = 15, wait_for_element: str = None) -> Optional[str]:
+    """
+    Fetch page content using Selenium WebDriver for JavaScript-heavy sites.
+    Optimized for low-memory environments like Render (0.5GB RAM).
+    """
+    driver = None
+    try:
+        # Configure Chrome options for minimal memory usage
+        chrome_options = Options()
+        chrome_options.add_argument('--headless')
+        chrome_options.add_argument('--no-sandbox')
+        chrome_options.add_argument('--disable-dev-shm-usage')
+        chrome_options.add_argument('--disable-gpu')
+        chrome_options.add_argument('--disable-extensions')
+        chrome_options.add_argument('--disable-plugins')
+        chrome_options.add_argument('--disable-images')
+        chrome_options.add_argument('--memory-pressure-off')
+        chrome_options.add_argument('--max_old_space_size=256')
+        chrome_options.add_argument('--window-size=1024,768')
+        chrome_options.add_argument('--disable-logging')
+        chrome_options.add_argument('--disable-background-timer-throttling')
+        chrome_options.add_argument('--disable-renderer-backgrounding')
+        chrome_options.add_argument('--disable-features=TranslateUI')
+        chrome_options.add_argument('--disable-ipc-flooding-protection')
+
+        # Create driver with minimal resource usage
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        driver.set_page_load_timeout(timeout)
+
+        # Load the page
+        driver.get(url)
+
+        # Wait for specific element if provided (e.g., price elements)
+        if wait_for_element:
+            try:
+                WebDriverWait(driver, min(10, timeout)).until(
+                    EC.presence_of_element_located((By.CSS_SELECTOR, wait_for_element))
+                )
+            except:
+                pass  # Continue even if specific element not found
+        else:
+            # Default wait for page to load
+            time.sleep(3)
+
+        # Get page source
+        html_content = driver.page_source
+        return html_content
+
+    except Exception as e:
+        print(f"[selenium_fetch] Error fetching {url}: {e}")
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
 
 
 def get_price(url: str) -> Optional[str]:

@@ -2,3 +2,5 @@ fastapi==0.112.0
 uvicorn[standard]==0.30.0
 requests==2.32.3
 pydantic==2.9.0
+selenium==4.35.0
+webdriver-manager==4.0.2
