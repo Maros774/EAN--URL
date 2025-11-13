@@ -23,7 +23,7 @@ from test import (
 app = FastAPI(title="Price Bridge", version="1.0")
 
 # Block marketplaces/aggregators
-BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com"}
+BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com", "proff.maxbo.no"}
 
 # --- very simple in-memory rate limit (per IP per minute) ---
 from time import time
