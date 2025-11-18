@@ -33,7 +33,7 @@ HEADERS = {
 }
 
 # Exclude marketplaces/aggregators we don't want
-BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com", "proff.maxbo.no"}
+BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com", "proff.maxbo.no", "svanemerket.no"}
 
 # Sites that REQUIRE Selenium (JavaScript-heavy, won't work with conventional fetch)
 JS_HEAVY_SITES = {"maxbo.no", "proff.maxbo.no"}
