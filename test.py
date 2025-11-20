@@ -11,6 +11,11 @@ import html
 import argparse
 from typing import Optional, Tuple, List, Iterable, Dict
 import requests
+from requests import Session
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+import threading
+import atexit
 from selenium import webdriver
 from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
@@ -37,6 +42,52 @@ BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagra
 
 # Sites that REQUIRE Selenium (JavaScript-heavy, won't work with conventional fetch)
 JS_HEAVY_SITES = {"maxbo.no", "proff.maxbo.no"}
+
+# Selenium state (one shared driver guarded by a lock)
+SELENIUM_LOCK = threading.Lock()
+_SELENIUM_DRIVER = None
+_SELENIUM_DRIVER_PATH: Optional[str] = None
+
+# Requests session (shared per thread)
+REQUESTS_LOCK = threading.Lock()
+_SESSION_POOL: Dict[int, Session] = {}
+
+
+def _build_requests_session() -> Session:
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=0.5,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=('GET', 'POST'),
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=16, pool_maxsize=32)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
+    return session
+
+
+def _get_session() -> Session:
+    thread_id = threading.get_ident()
+    session = _SESSION_POOL.get(thread_id)
+    if session is None:
+        with REQUESTS_LOCK:
+            session = _SESSION_POOL.get(thread_id)
+            if session is None:
+                session = _build_requests_session()
+                _SESSION_POOL[thread_id] = session
+    return session
+
+
+def _close_all_sessions():
+    with REQUESTS_LOCK:
+        sessions = list(_SESSION_POOL.values())
+        _SESSION_POOL.clear()
+    for sess in sessions:
+        try:
+            sess.close()
+        except Exception:
+            pass
 
 # --- Regex building blocks (allow normal/NBSP/thin spaces) ---
 SP = r"[\s\u00A0\u202F]*"
@@ -72,6 +123,9 @@ COMMON_PRICE_KEYS = {
     # Maxbo-specific patterns
     "displayPrice", "sellPrice", "retailPrice", "consumerPrice"
 }
+COMMON_PRICE_KEYS_LOWER = {k.lower() for k in COMMON_PRICE_KEYS}
+PRICE_MEMBER_KEYWORDS = ("member", "medlem", "club", "loyalty")
+PRICE_REGULAR_KEYWORDS = ("regular", "list", "original", "normal")
 
 def _find_prices_in_json(obj, path: str = "") -> List[dict]:
     """Enhanced price finder that tracks context and price types"""
@@ -83,10 +137,13 @@ def _find_prices_in_json(obj, path: str = "") -> List[dict]:
             lk = str(k).lower()
 
             # Check if this key indicates a price
-            if lk in {pk.lower() for pk in COMMON_PRICE_KEYS} and isinstance(v, (int, float, str)):
-                price_type = "member" if any(term in lk for term in ["member", "medlem", "club", "loyalty"]) else \
-                            "regular" if any(term in lk for term in ["regular", "list", "original", "normal"]) else \
-                            "base"
+            if lk in COMMON_PRICE_KEYS_LOWER and isinstance(v, (int, float, str)):
+                if any(term in lk for term in PRICE_MEMBER_KEYWORDS):
+                    price_type = "member"
+                elif any(term in lk for term in PRICE_REGULAR_KEYWORDS):
+                    price_type = "regular"
+                else:
+                    price_type = "base"
                 found.append({
                     "value": str(v),
                     "type": price_type,
@@ -186,6 +243,9 @@ def deep_get(obj, path: List[str]):
 # --- Hints for member vs regular pricing ---
 MEMBER_HINTS = re.compile(r"(member|medlem|fordel|bonus|klubb|club)", re.I)
 REGULAR_HINTS = re.compile(r"(ordin\u00E6r|veiledende|uten\s*medlemskap|non-?member|ikke\s*medlem|normalpris)", re.I)
+
+FOREIGN_CURRENCIES = {"EUR", "USD", "GBP"}
+NOK_MIN_REASONABLE = 100.0
 
 RE_PRICE_BLOCKS = [
     re.compile(r'<(?:div|span)[^>]+(?:class|id)\s*=\s*"[^"]*(?:product-price__price|product-price|product_price|product__price|price__|price--|price-|prisbel[øo]p|kampanjepris|totalpris|pris|amount)[^"]*"[^>]*>(.{0,4000}?)</\s*(?:div|span)>', re.I | re.S),
@@ -312,11 +372,12 @@ def normalize_price_no(raw: Optional[str]) -> Optional[str]:
     val, cur = price_to_number(raw)
     if val is None:
         return None
-    # For Norwegian sites, convert NOK and reasonable prices to kr format
-    # Only keep foreign currency if it's clearly a major international currency with large amounts
-    if cur in ('EUR', 'USD', 'GBP') and val > 100:
-        return raw  # Keep major foreign currencies for expensive items
-    # Convert NOK, unknown currency, and everything else to Norwegian kr format
+    cur = cur or "NOK"
+    if cur.upper() in FOREIGN_CURRENCIES:
+        # keep obvious foreign currencies if they look reasonable in their own unit
+        return raw if val >= NOK_MIN_REASONABLE else None
+    if cur.upper() == "NOK" and val < NOK_MIN_REASONABLE:
+        return None
     return f"kr {_fmt_number_no(val)}"
 
 
@@ -770,7 +831,7 @@ def extract_maxbo(html_text: str, expected_ean: str) -> Optional[dict]:
             raw_txt = _strip_tags(m.group(1))
             cands = extract_prices_from_text(raw_txt)
             if cands:
-                all_found_prices.extend(cands)
+                all_found_prices.extend([c for c in cands if re.search(r'(kr|nok)', c, re.I)])
 
                 # Classify by context
                 context = m.group(0).lower()
@@ -950,25 +1011,25 @@ def extract_norwegian_prices_enhanced(html_text: str) -> Optional[str]:
 
             # Clean and validate
             if re.search(r'\d', price_text):
-                # Try to extract with existing function first
                 prices_found = extract_prices_from_text(price_text)
-                if prices_found:
-                    all_matches.extend(prices_found)
-                else:
-                    # Handle direct number matches
+                nok_only = [p for p in prices_found if re.search(r'(kr|nok)', p, re.I)]
+                if nok_only:
+                    all_matches.extend(nok_only)
+                elif not prices_found:
                     num_match = re.search(r'(\d+(?:[.,]\d+)?)', price_text)
                     if num_match:
                         num_part = num_match.group(1)
-                        # Convert to Norwegian format
                         all_matches.append(f"kr {num_part}")
 
     if all_matches:
-        # Filter reasonable prices and prefer Norwegian currency
         reasonable_prices = []
         for price in all_matches:
             val, cur = price_to_number(price)
-            if val and 10 <= val <= 100000:  # Reasonable price range for Norwegian products
-                reasonable_prices.append(price)
+            if not val or not (10 <= val <= 100000):
+                continue
+            if cur and cur.upper() in FOREIGN_CURRENCIES:
+                continue
+            reasonable_prices.append(price)
 
         if reasonable_prices:
             return _best_from_candidates(reasonable_prices)
@@ -1024,6 +1085,8 @@ def extract_prices_from_html(html_text: str, local_host: str, expected_ean: Opti
         elif debug:
             print("[debug] maxbo extractor: no match")
 
+    ean_found: Optional[bool] = None
+
     # 2) Generic: match variant by EAN from JSON-LD / __NEXT_DATA__ (if EAN provided)
     if expected_ean:
         if debug:
@@ -1055,8 +1118,10 @@ def extract_prices_from_html(html_text: str, local_host: str, expected_ean: Opti
         d["price_member"] = normalize_price_no(d.get("price_member")) or d.get("price_member")
 
     if expected_ean:
+        if ean_found is None:
+            ean_found = page_contains_ean(html_text, expected_ean)
         # If EAN not found but we got prices, be more cautious (lower confidence)
-        if not page_contains_ean(html_text, expected_ean) and any(d.values()):
+        if not ean_found and any(d.values()):
             if debug:
                 print("[debug] fallback detect_prices: OK (no EAN validation, lower confidence)")
         elif debug:
@@ -1303,8 +1368,9 @@ def get_prices_for_ean(url: str, expected_ean: str, debug: bool = False) -> dict
     return attempt(url)
 
 def fetch(url: str, timeout: int = 10, max_bytes: int = 300_000) -> Optional[str]:
+    session = _get_session()
     try:
-        r = requests.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=True)
+        r = session.get(url, headers=HEADERS, timeout=timeout, allow_redirects=True, stream=True)
         r.raise_for_status()
         content = r.content[:max_bytes]
         return content.decode(r.encoding or 'utf-8', errors='replace')
@@ -1312,75 +1378,108 @@ def fetch(url: str, timeout: int = 10, max_bytes: int = 300_000) -> Optional[str
         return None
 
 
+def _build_chrome_options() -> Options:
+    chrome_options = Options()
+    chrome_options.add_argument('--headless')
+    chrome_options.add_argument('--no-sandbox')
+    chrome_options.add_argument('--disable-dev-shm-usage')
+    chrome_options.add_argument('--disable-gpu')
+    chrome_options.add_argument('--disable-extensions')
+    chrome_options.add_argument('--disable-plugins')
+    chrome_options.add_argument('--disable-images')
+    chrome_options.add_argument('--memory-pressure-off')
+    chrome_options.add_argument('--max_old_space_size=256')
+    chrome_options.add_argument('--window-size=1024,768')
+    chrome_options.add_argument('--disable-logging')
+    chrome_options.add_argument('--disable-background-timer-throttling')
+    chrome_options.add_argument('--disable-renderer-backgrounding')
+    chrome_options.add_argument('--disable-features=TranslateUI')
+    chrome_options.add_argument('--disable-ipc-flooding-protection')
+
+    chrome_bin = os.getenv('CHROME_BIN')
+    if chrome_bin:
+        chrome_options.binary_location = chrome_bin
+    return chrome_options
+
+
+def _resolve_chromedriver_path() -> str:
+    global _SELENIUM_DRIVER_PATH
+    if _SELENIUM_DRIVER_PATH:
+        return _SELENIUM_DRIVER_PATH
+
+    candidates = [
+        os.getenv('CHROMEDRIVER_PATH'),
+        '/usr/bin/chromedriver',
+    ]
+    for cand in candidates:
+        if cand and os.path.exists(cand):
+            _SELENIUM_DRIVER_PATH = cand
+            return cand
+
+    # Ultimate fallback: webdriver-manager (only runs once)
+    path = ChromeDriverManager().install()
+    _SELENIUM_DRIVER_PATH = path
+    return path
+
+
+def _reset_selenium_driver():
+    global _SELENIUM_DRIVER
+    if _SELENIUM_DRIVER:
+        try:
+            _SELENIUM_DRIVER.quit()
+        except Exception:
+            pass
+        finally:
+            _SELENIUM_DRIVER = None
+
+
+def _get_selenium_driver() -> webdriver.Chrome:
+    global _SELENIUM_DRIVER
+    if _SELENIUM_DRIVER is None:
+        options = _build_chrome_options()
+        chromedriver_path = _resolve_chromedriver_path()
+        service = Service(chromedriver_path)
+        _SELENIUM_DRIVER = webdriver.Chrome(service=service, options=options)
+    return _SELENIUM_DRIVER
+
+
+atexit.register(_reset_selenium_driver)
+atexit.register(_close_all_sessions)
+
+
 def selenium_fetch(url: str, timeout: int = 15, wait_for_element: str = None) -> Optional[str]:
     """
     Fetch page content using Selenium WebDriver for JavaScript-heavy sites.
     Optimized for low-memory environments like Render (0.5GB RAM).
     """
-    driver = None
-    try:
-        # Configure Chrome options for minimal memory usage
-        chrome_options = Options()
-        chrome_options.add_argument('--headless')
-        chrome_options.add_argument('--no-sandbox')
-        chrome_options.add_argument('--disable-dev-shm-usage')
-        chrome_options.add_argument('--disable-gpu')
-        chrome_options.add_argument('--disable-extensions')
-        chrome_options.add_argument('--disable-plugins')
-        chrome_options.add_argument('--disable-images')
-        chrome_options.add_argument('--memory-pressure-off')
-        chrome_options.add_argument('--max_old_space_size=256')
-        chrome_options.add_argument('--window-size=1024,768')
-        chrome_options.add_argument('--disable-logging')
-        chrome_options.add_argument('--disable-background-timer-throttling')
-        chrome_options.add_argument('--disable-renderer-backgrounding')
-        chrome_options.add_argument('--disable-features=TranslateUI')
-        chrome_options.add_argument('--disable-ipc-flooding-protection')
+    with SELENIUM_LOCK:
+        try:
+            driver = _get_selenium_driver()
+        except Exception as e:
+            print(f"[selenium_fetch] Failed to initialize driver: {e}")
+            _reset_selenium_driver()
+            return None
 
-        # Set Chrome binary location from environment (Docker/Render.com)
-        chrome_bin = os.getenv('CHROME_BIN')
-        if chrome_bin:
-            chrome_options.binary_location = chrome_bin
+        try:
+            driver.set_page_load_timeout(timeout)
+            driver.get(url)
 
-        # Create driver with minimal resource usage
-        # Use system chromedriver if available (Docker/Render.com), otherwise use webdriver-manager
-        chromedriver_path = os.getenv('CHROMEDRIVER_PATH')
-        if chromedriver_path and os.path.exists(chromedriver_path):
-            service = Service(chromedriver_path)
-        else:
-            service = Service(ChromeDriverManager().install())
+            if wait_for_element:
+                try:
+                    WebDriverWait(driver, min(10, timeout)).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, wait_for_element))
+                    )
+                except Exception:
+                    pass
+            else:
+                time.sleep(3)
 
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        driver.set_page_load_timeout(timeout)
-
-        # Load the page
-        driver.get(url)
-
-        # Wait for specific element if provided (e.g., price elements)
-        if wait_for_element:
-            try:
-                WebDriverWait(driver, min(10, timeout)).until(
-                    EC.presence_of_element_located((By.CSS_SELECTOR, wait_for_element))
-                )
-            except:
-                pass  # Continue even if specific element not found
-        else:
-            # Default wait for page to load
-            time.sleep(3)
-
-        # Get page source
-        html_content = driver.page_source
-        return html_content
-
-    except Exception as e:
-        print(f"[selenium_fetch] Error fetching {url}: {e}")
-        return None
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
+            return driver.page_source
+        except Exception as e:
+            print(f"[selenium_fetch] Error fetching {url}: {e}")
+            # Reset driver for future attempts
+            _reset_selenium_driver()
+            return None
 
 
 def get_price(url: str) -> Optional[str]:
@@ -1390,8 +1489,9 @@ def get_price(url: str) -> Optional[str]:
 # -------- UPCitemdb --------
 
 def upcitemdb_lookup(ean: str) -> List[dict]:
+    session = _get_session()
     try:
-        resp = requests.get(UPCITEMDB_TRIAL_URL, params={'upc': ean}, timeout=10)
+        resp = session.get(UPCITEMDB_TRIAL_URL, params={'upc': ean}, timeout=10)
         resp.raise_for_status()
         data = resp.json()
     except Exception:
@@ -1474,8 +1574,9 @@ def google_cse_fetch(api_key: str, cx: str, query: str, hl: Optional[str], gl: O
     if hl: params['hl'] = hl
     if gl: params['gl'] = gl
     url = 'https://www.googleapis.com/customsearch/v1'
+    session = _get_session()
     try:
-        r = requests.get(url, params=params, timeout=12)
+        r = session.get(url, params=params, timeout=12)
         r.raise_for_status()
         return r.json()
     except Exception as e:

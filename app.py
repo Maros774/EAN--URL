@@ -1,8 +1,9 @@
 from fastapi import FastAPI, Query, Header, HTTPException, Response
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Tuple
 from datetime import datetime
 from fastapi import Request
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import os, requests
 
 # Import logiky z test.py
@@ -24,6 +25,7 @@ app = FastAPI(title="Price Bridge", version="1.0")
 
 # Block marketplaces/aggregators
 BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com", "proff.maxbo.no"}
+EAN_FETCH_WORKERS = max(1, int(os.getenv("EAN_FETCH_WORKERS", "4")))
 
 # --- very simple in-memory rate limit (per IP per minute) ---
 from time import time
@@ -34,9 +36,13 @@ _rate: dict = {}
 def allow(ip: str) -> bool:
     now = time()
     window = int(now // _LIMIT_WINDOW)
-    key = (ip, window)
-    _rate[key] = _rate.get(key, 0) + 1
-    return _rate[key] <= _LIMIT_REQ
+    bucket = _rate.setdefault(ip, {})
+    # drop stale windows to prevent unbounded growth
+    stale = [w for w in bucket if w < window - 1]
+    for w in stale:
+        bucket.pop(w, None)
+    bucket[window] = bucket.get(window, 0) + 1
+    return bucket[window] <= _LIMIT_REQ
 
 @app.get("/health")
 def health():
@@ -182,55 +188,96 @@ def endpoint_ean(
     api_key = os.getenv("GOOGLE_API_KEY", GOOGLE_API_KEY)
     cx = os.getenv("GOOGLE_CSE_CX", GOOGLE_CSE_CX)
 
-    for q in queries:
-        if len(out) >= limit:
-            break
-        for page in range(0, 2):  # max 20 výsledkov/query
-            start = 1 + page * 10
-            data = google_cse_fetch(api_key, cx, q, hl, gl, num=10, start=start)
-            items = data.get("items") or []
-            if not items:
+    processing_links = set()
+    limit_reached = False
+
+    def _process_batch(batch, executor: ThreadPoolExecutor):
+        nonlocal limit_reached
+        if not batch:
+            return
+        future_map = {
+            executor.submit(get_prices_for_ean, link, ean): (link, host)
+            for link, host in batch
+        }
+        batch.clear()
+        for future in as_completed(future_map):
+            link, host = future_map[future]
+            processing_links.discard(link)
+            if limit_reached:
+                continue
+            try:
+                prices = future.result()
+            except Exception:
+                continue
+
+            if not prices or not prices.get("price"):
+                if include_empty:
+                    out.append(PriceItem(
+                        retailer=host,
+                        url=link,
+                        price=None,
+                        price_regular=None,
+                        price_member=None,
+                        ts=datetime.utcnow().isoformat(),
+                    ))
+                    printed_links.add(link)
+                    seen_per_domain[host] = seen_per_domain.get(host, 0) + 1
+                    if len(out) >= limit:
+                        limit_reached = True
+                continue
+
+            out.append(PriceItem(
+                retailer=host,
+                url=link,
+                price=prices.get("price"),
+                price_regular=prices.get("price_regular"),
+                price_member=prices.get("price_member"),
+                ts=datetime.utcnow().isoformat(),
+            ))
+            printed_links.add(link)
+            seen_per_domain[host] = seen_per_domain.get(host, 0) + 1
+            if len(out) >= limit:
+                limit_reached = True
+
+    with ThreadPoolExecutor(max_workers=EAN_FETCH_WORKERS) as executor:
+        to_fetch: List[Tuple[str, str]] = []
+        for q in queries:
+            if limit_reached or len(out) >= limit:
                 break
-            for it in items:
-                link = it.get("link")
-                if not link or link in printed_links:
-                    continue
-                host = host_from_url(link)
-                if host in BLOCKLIST:
-                    continue
-                if only_no and not host.endswith(".no"):
-                    continue
-                # removed TLD restriction to allow all markets
-                if per_domain > 0 and seen_per_domain.get(host, 0) >= per_domain:
-                    continue
-
-                prices = get_prices_for_ean(link, ean)
-                if not prices or not prices.get("price"):
-                    if include_empty:
-                        out.append(PriceItem(
-                            retailer=host,
-                            url=link,
-                            price=None,
-                            price_regular=None,
-                            price_member=None,
-                            ts=datetime.utcnow().isoformat(),
-                        ))
-                        printed_links.add(link)
-                        seen_per_domain[host] = seen_per_domain.get(host, 0) + 1
-                    continue
-
-                out.append(PriceItem(
-                    retailer=host,
-                    url=link,
-                    price=prices.get("price"),
-                    price_regular=prices.get("price_regular"),
-                    price_member=prices.get("price_member"),
-                    ts=datetime.utcnow().isoformat(),
-                ))
-                printed_links.add(link)
-                seen_per_domain[host] = seen_per_domain.get(host, 0) + 1
-                if len(out) >= limit:
+            for page in range(0, 2):  # max 20 výsledkov/query
+                if limit_reached or len(out) >= limit:
                     break
+                start = 1 + page * 10
+                data = google_cse_fetch(api_key, cx, q, hl, gl, num=10, start=start)
+                items = data.get("items") or []
+                if not items:
+                    break
+                for it in items:
+                    if limit_reached or len(out) >= limit:
+                        break
+                    link = it.get("link")
+                    if not link or link in printed_links or link in processing_links:
+                        continue
+                    host = host_from_url(link)
+                    if host in BLOCKLIST:
+                        continue
+                    if only_no and not host.endswith(".no"):
+                        continue
+                    if per_domain > 0 and seen_per_domain.get(host, 0) >= per_domain:
+                        continue
 
+                    processing_links.add(link)
+                    to_fetch.append((link, host))
+                    batch_target = max(1, min(EAN_FETCH_WORKERS, limit - len(out)))
+                    if len(to_fetch) >= batch_target:
+                        _process_batch(to_fetch, executor)
+                        to_fetch = []
+
+        if to_fetch:
+            if not limit_reached and len(out) < limit:
+                _process_batch(to_fetch, executor)
+            else:
+                for link, _ in to_fetch:
+                    processing_links.discard(link)
 
     return {"items": out}
