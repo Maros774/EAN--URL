@@ -247,10 +247,32 @@ REGULAR_HINTS = re.compile(r"(ordin\u00E6r|veiledende|uten\s*medlemskap|non-?mem
 FOREIGN_CURRENCIES = {"EUR", "USD", "GBP"}
 NOK_MIN_REASONABLE = 100.0
 
+# Optional host-specific extractors
+SITE_EXTRACTORS: Dict[str, callable] = {}
+
 RE_PRICE_BLOCKS = [
-    re.compile(r'<(?:div|span)[^>]+(?:class|id)\s*=\s*"[^"]*(?:product-price__price|product-price|product_price|product__price|price__|price--|price-|prisbel[øo]p|kampanjepris|totalpris|pris|amount)[^"]*"[^>]*>(.{0,4000}?)</\s*(?:div|span)>', re.I | re.S),
-    re.compile(r'<(?:div|span)[^>]+(?:class|id)\s*=\s*"[^"]*(?:price|pris)[^"]*"[^>]*>(.{0,8000}?)</\s*(?:div|span)>', re.I | re.S),
+    re.compile(r'<(?:div|span)[^>]+(?:class|id)\s*=\s*"[^"]*(?:product-price__price|product-price|product_price|product__price|price__|price--|price-|prisbel[øo]p|kampanjepris|totalpris|pris|amount|b_pris)[^"]*"[^>]*>(.{0,4000}?)</\s*(?:div|span|p|b)>', re.I | re.S),
+    re.compile(r'<(?:div|span|p)[^>]+(?:class|id)\s*=\s*"[^"]*(?:price|pris|b_pris)[^"]*"[^>]*>(.{0,8000}?)</\s*(?:div|span|p|b)>', re.I | re.S),
+    re.compile(r'<[bB][^>]*>([^<]+)</[bB]>', re.I | re.S),
 ]
+
+RE_ELDIREKTE_PRICE = re.compile(
+    r'(<(?:div|span)[^>]+class="[^"]*b-product-price__main[^"]*"[^>]*>)(.*?)</(?:div|span)>',
+    re.I | re.S
+)
+RE_GAUS_PRICE = re.compile(
+    r'<(?:span|div)[^>]+class="[^"]*mui-5v7q5n[^"]*"[^>]*>(.*?)</(?:span|div)>',
+    re.I | re.S
+)
+RE_BYGGMAKKER_PRICE = re.compile(
+    r'<(?:span|div)[^>]+class="[^"]*price-view__sale-price--priceNO[^"]*"[^>]*>(.*?)</(?:span|div)>',
+    re.I | re.S
+)
+RE_FAUSKANGER_PRICE = re.compile(
+    r'<(?:p|div)[^>]+class="[^"]*price[^"]*"[^>]*>(.*?)</(?:p|div)>',
+    re.I | re.S
+)
+RE_B_PRIS_BLOCK = re.compile(r'<b_pris[^>]*>(.*?)</b_pris>', re.I | re.S)
 
 # -------- Utils --------
 
@@ -372,24 +394,31 @@ def normalize_price_no(raw: Optional[str]) -> Optional[str]:
     val, cur = price_to_number(raw)
     if val is None:
         return None
-    cur = cur or "NOK"
-    if cur.upper() in FOREIGN_CURRENCIES:
+    cur = cur.upper() if cur else "NOK"
+    if cur in FOREIGN_CURRENCIES:
         # keep obvious foreign currencies if they look reasonable in their own unit
         return raw if val >= NOK_MIN_REASONABLE else None
-    if cur.upper() == "NOK" and val < NOK_MIN_REASONABLE:
+    if cur == "NOK" and val < NOK_MIN_REASONABLE:
         return None
     return f"kr {_fmt_number_no(val)}"
 
 
 def _best_from_candidates(raws: Iterable[str]) -> Optional[str]:
-    best_raw, best_val = None, None
+    preferred_raw = preferred_val = None
+    fallback_raw = fallback_val = None
     for r in raws:
-        val, _cur = price_to_number(r)
+        val, cur = price_to_number(r)
         if val is None:
             continue
-        if best_val is None or val < best_val:
-            best_val, best_raw = val, str(r).strip()
-    return best_raw
+        is_nokish = (cur and cur.upper() == "NOK") or (cur is None and re.search(r'(kr|nok)', str(r), re.I))
+        target = (preferred_raw, preferred_val) if (is_nokish and val >= NOK_MIN_REASONABLE) else (fallback_raw, fallback_val)
+        raw_str = str(r).strip()
+        if target[1] is None or val < target[1]:
+            if is_nokish and val >= NOK_MIN_REASONABLE:
+                preferred_raw, preferred_val = raw_str, val
+            else:
+                fallback_raw, fallback_val = raw_str, val
+    return preferred_raw or fallback_raw
 
 
 def extract_prices_from_text(text: str) -> List[str]:
@@ -907,6 +936,126 @@ def extract_maxbo_fallback_prices(html_text: str) -> Optional[dict]:
 
     return None
 
+
+def extract_eldirekte(html_text: str, expected_ean: Optional[str] = None, debug: bool = False) -> Optional[dict]:
+    """Eldirekte extractor that reads dedicated price block."""
+    if not html_text:
+        return {"price": None, "price_regular": None, "price_member": None}
+
+    match = RE_ELDIREKTE_PRICE.search(html_text or "")
+    if not match:
+        return {"price": None, "price_regular": None, "price_member": None}
+
+    block = match.group(0)
+    raw_inner = match.group(2)
+
+    data_attr = re.search(r'data-(?:price|amount)\s*=\s*"([^"]+)"', block, re.I)
+    if data_attr:
+        raw = f"kr {data_attr.group(1)}"
+    else:
+        raw = _strip_tags(raw_inner) or _strip_tags(block)
+
+    raw = raw.strip()
+    if not raw:
+        return {"price": None, "price_regular": None, "price_member": None}
+
+    price = normalize_price_no(raw) or raw
+    if not price:
+        return {"price": None, "price_regular": None, "price_member": None}
+
+    return {"price": price, "price_regular": None, "price_member": None}
+
+
+SITE_EXTRACTORS.update({
+    "eldirekte.no": extract_eldirekte,
+})
+
+
+def extract_gaus(html_text: str, expected_ean: Optional[str] = None, debug: bool = False) -> Optional[dict]:
+    if not html_text:
+        return None
+
+    match = RE_GAUS_PRICE.search(html_text or "")
+    if not match:
+        return None
+
+    raw = _strip_tags(match.group(1) or "").strip()
+    if not raw or not re.search(r'\d', raw):
+        return None
+
+    price = normalize_price_no(raw) or raw
+    if not price:
+        return None
+
+    return {"price": price, "price_regular": None, "price_member": None}
+
+
+SITE_EXTRACTORS.update({
+    "gaus.no": extract_gaus,
+})
+
+
+def extract_byggmakker(html_text: str, expected_ean: Optional[str] = None, debug: bool = False) -> Optional[dict]:
+    if not html_text:
+        return None
+    match = RE_BYGGMAKKER_PRICE.search(html_text or "")
+    if not match:
+        return None
+    raw = _strip_tags(match.group(1) or "").strip()
+    if not raw or not re.search(r'\d', raw):
+        return None
+    price = normalize_price_no(raw) or raw
+    if not price:
+        return None
+    return {"price": price, "price_regular": None, "price_member": None}
+
+
+SITE_EXTRACTORS.update({
+    "byggmakker.no": extract_byggmakker,
+})
+
+
+def extract_fauskangerbygg(html_text: str, expected_ean: Optional[str] = None, debug: bool = False) -> Optional[dict]:
+    if not html_text:
+        return None
+
+    match = RE_B_PRIS_BLOCK.search(html_text or "")
+    if not match:
+        match = RE_FAUSKANGER_PRICE.search(html_text or "")
+    if not match:
+        return None
+
+    raw = _strip_tags(match.group(1) or "").strip()
+    if not raw or not re.search(r'\d', raw):
+        return None
+
+    price = normalize_price_no(raw) or raw
+    if not price:
+        val, _ = price_to_number(raw)
+        if val is None:
+            return None
+        price = f"kr {_fmt_number_no(val)}"
+
+    return {"price": price, "price_regular": None, "price_member": None}
+
+
+SITE_EXTRACTORS.update({
+    "fauskangerbygg.no": extract_fauskangerbygg,
+})
+
+def _filter_nok_candidates(raws: Iterable[str]) -> List[str]:
+    nok = []
+    for raw in raws:
+        val, cur = price_to_number(raw)
+        if val is None:
+            continue
+        if cur and cur.upper() in FOREIGN_CURRENCIES:
+            continue
+        if re.search(r'(kr|nok)', raw or '', re.I):
+            nok.append(raw)
+    return nok
+
+
 # --- Member/regular price detection ---
 def detect_prices(html_text: str) -> dict:
     """Return dict with potential base/regular/member prices detected from HTML."""
@@ -945,8 +1094,8 @@ def detect_prices(html_text: str) -> dict:
     # 4) Filter candidates by currency preference (medium reliability)
     if not base and candidates:
         # Prefer Norwegian currency
-        norwegian_candidates = [raw for _ctx, raw in candidates if any(term in raw.lower() for term in ['kr', 'nok'])]
-        foreign_candidates = [raw for _ctx, raw in candidates if not any(term in raw.lower() for term in ['kr', 'nok'])]
+        norwegian_candidates = _filter_nok_candidates((raw for _ctx, raw in candidates))
+        foreign_candidates = [raw for _ctx, raw in candidates if raw not in norwegian_candidates]
 
         if norwegian_candidates:
             base = _best_from_candidates(norwegian_candidates)
@@ -1085,6 +1234,22 @@ def extract_prices_from_html(html_text: str, local_host: str, expected_ean: Opti
         elif debug:
             print("[debug] maxbo extractor: no match")
 
+    extractor = SITE_EXTRACTORS.get(local_host)
+    if extractor:
+        if debug:
+            print(f"[debug] {local_host} extractor: start")
+        out = extractor(html_text, expected_ean, debug=debug)
+        if out:
+            if local_host.endswith('.no'):
+                out["price"] = normalize_price_no(out.get("price")) or out.get("price")
+                out["price_regular"] = normalize_price_no(out.get("price_regular")) or out.get("price_regular")
+                out["price_member"] = normalize_price_no(out.get("price_member")) or out.get("price_member")
+            if debug:
+                print(f"[debug] {local_host} extractor: OK price={out.get('price')} regular={out.get('price_regular')} member={out.get('price_member')}")
+            return out
+        elif debug:
+            print(f"[debug] {local_host} extractor: no match")
+
     ean_found: Optional[bool] = None
 
     # 2) Generic: match variant by EAN from JSON-LD / __NEXT_DATA__ (if EAN provided)
@@ -1112,10 +1277,9 @@ def extract_prices_from_html(html_text: str, local_host: str, expected_ean: Opti
     if debug:
         print("[debug] fallback detect_prices: start")
     d = detect_prices(html_text)
-    if local_host.endswith('.no'):
-        d["price"] = normalize_price_no(d.get("price")) or d.get("price")
-        d["price_regular"] = normalize_price_no(d.get("price_regular")) or d.get("price_regular")
-        d["price_member"] = normalize_price_no(d.get("price_member")) or d.get("price_member")
+    if debug:
+        print(f"[debug] detect_prices raw result: {d}")
+    host_min = None
 
     if expected_ean:
         if ean_found is None:

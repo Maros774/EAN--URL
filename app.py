@@ -24,7 +24,17 @@ from test import (
 app = FastAPI(title="Price Bridge", version="1.0")
 
 # Block marketplaces/aggregators
-BLOCKLIST = {"finn.no", "m.finn.no", "facebook.com", "m.facebook.com", "instagram.com", "proff.maxbo.no"}
+BLOCKLIST = {
+    "finn.no",
+    "m.finn.no",
+    "facebook.com",
+    "m.facebook.com",
+    "instagram.com",
+    "proff.maxbo.no",
+    "media.bondekompaniet.no",
+    "norengros.no",
+    "www.norengros.no",
+}
 EAN_FETCH_WORKERS = max(1, int(os.getenv("EAN_FETCH_WORKERS", "4")))
 
 # --- very simple in-memory rate limit (per IP per minute) ---
